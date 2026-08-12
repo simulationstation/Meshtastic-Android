@@ -27,8 +27,10 @@ import dev.mokkery.mock
 import dev.mokkery.verify
 import dev.mokkery.verify.VerifyMode.Companion.exactly
 import dev.mokkery.verifySuspend
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestDispatcher
@@ -43,6 +45,7 @@ import org.meshtastic.core.model.DataPacket
 import org.meshtastic.core.model.Node
 import org.meshtastic.core.repository.AppWidgetUpdater
 import org.meshtastic.core.repository.CommandSender
+import org.meshtastic.core.repository.HandshakeConstants
 import org.meshtastic.core.repository.HistoryManager
 import org.meshtastic.core.repository.MeshLocationManager
 import org.meshtastic.core.repository.MeshNotificationManager
@@ -54,6 +57,7 @@ import org.meshtastic.core.repository.PacketHandler
 import org.meshtastic.core.repository.PacketRepository
 import org.meshtastic.core.repository.PlatformAnalytics
 import org.meshtastic.core.repository.RadioConfigRepository
+import org.meshtastic.core.repository.RadioConnectionSnapshot
 import org.meshtastic.core.repository.RadioInterfaceService
 import org.meshtastic.core.repository.ServiceRepository
 import org.meshtastic.core.repository.SessionManager
@@ -94,7 +98,8 @@ class MeshConnectionManagerImplTest {
 
     private val dataPacket = DataPacket(id = 456, time = 0L, to = "0", from = "0", bytes = null, dataType = 0)
 
-    private val radioConnectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
+    private val radioConnectionSnapshot = MutableStateFlow(RadioConnectionSnapshot(ConnectionState.Disconnected, 0L))
+    private val radioConnectionState = TrackingConnectionStateFlow(radioConnectionSnapshot)
     private val connectionStateFlow = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
     private val localConfigFlow = MutableStateFlow(LocalConfig())
     private val moduleConfigFlow = MutableStateFlow(LocalModuleConfig())
@@ -125,12 +130,14 @@ class MeshConnectionManagerImplTest {
         lockdownCoordinator = FakeLockdownCoordinator()
 
         testDispatcher = UnconfinedTestDispatcher()
+        radioConnectionSnapshot.value = RadioConnectionSnapshot(ConnectionState.Disconnected, 0L)
         radioConnectionState.value = ConnectionState.Disconnected
         connectionStateFlow.value = ConnectionState.Disconnected
         localConfigFlow.value = LocalConfig()
         moduleConfigFlow.value = LocalModuleConfig()
 
         every { radioInterfaceService.connectionState } returns radioConnectionState
+        every { radioInterfaceService.connectionSnapshot } returns radioConnectionSnapshot
         every { radioConfigRepository.localConfigFlow } returns localConfigFlow
         every { radioConfigRepository.moduleConfigFlow } returns moduleConfigFlow
         every { serviceRepository.connectionState } returns connectionStateFlow
@@ -218,6 +225,120 @@ class MeshConnectionManagerImplTest {
             wantConfig.want_config_id,
             "Second packet should be want_config_id with CONFIG_NONCE",
         )
+    }
+
+    @Test
+    fun `conflated reconnect starts a fresh handshake`() = runTest(StandardTestDispatcher()) {
+        val sentPackets = mutableListOf<org.meshtastic.proto.ToRadio>()
+        every { packetHandler.sendToRadio(any<org.meshtastic.proto.ToRadio>()) } calls
+            { call ->
+                sentPackets.add(call.arg(0))
+            }
+
+        manager = createManager(backgroundScope)
+        runCurrent()
+
+        // Establish and finish the first connection.
+        radioConnectionState.value = ConnectionState.Connected
+        runCurrent()
+        advanceTimeBy(200)
+        runCurrent()
+        assertEquals(2, sentPackets.size, "Initial connection must start exactly one heartbeat + config handshake")
+        connectionStateFlow.value = ConnectionState.Connected
+        sentPackets.clear()
+
+        // The transport disconnects and reconnects while this collector is not scheduled. StateFlow is allowed to
+        // conflate DeviceSleep -> Connected back to a Connected snapshot, but the newer epoch survives.
+        radioConnectionState.value = ConnectionState.DeviceSleep
+        radioConnectionState.value = ConnectionState.Connected
+        runCurrent()
+        advanceTimeBy(200)
+        runCurrent()
+
+        assertEquals(
+            2,
+            sentPackets.size,
+            "A fresh epoch must send heartbeat + want_config after a conflated reconnect",
+        )
+        assertTrue(sentPackets.first().heartbeat != null)
+        assertEquals(HandshakeConstants.CONFIG_NONCE, sentPackets.last().want_config_id)
+        assertEquals(ConnectionState.Connecting, serviceRepository.connectionState.value)
+        verify(exactly(1)) { packetHandler.stopPacketQueue() }
+        verify(exactly(1)) { sessionManager.clearAll() }
+        verify(exactly(1)) { locationManager.stop() }
+        verify(exactly(1)) { mqttManager.stop() }
+    }
+
+    @Test
+    fun `delayed disconnect from old epoch cannot tear down newer connection`() = runTest(StandardTestDispatcher()) {
+        val configGate = CompletableDeferred<LocalConfig>()
+        every { radioConfigRepository.localConfigFlow } returns flow { emit(configGate.await()) }
+        val observedStates = mutableListOf<ConnectionState>()
+        every { serviceRepository.setConnectionState(any()) } calls
+            { call ->
+                call.arg<ConnectionState>(0).also {
+                    observedStates += it
+                    connectionStateFlow.value = it
+                }
+            }
+
+        // Start on an established raw connection so the initial snapshot does not need the delayed config policy.
+        radioConnectionState.value = ConnectionState.Connected
+        manager = createManager(backgroundScope)
+        runCurrent()
+        advanceTimeBy(200)
+        runCurrent()
+        connectionStateFlow.value = ConnectionState.Connected
+        observedStates.clear()
+
+        radioConnectionState.value = ConnectionState.DeviceSleep
+        runCurrent() // Suspend this old epoch while loading the light-sleep policy.
+        radioConnectionState.value = ConnectionState.Connected
+        configGate.complete(LocalConfig(power = Config.PowerConfig(is_power_saving = true)))
+        runCurrent()
+        advanceTimeBy(200)
+        runCurrent()
+
+        assertTrue(ConnectionState.DeviceSleep !in observedStates, "The stale down edge must be discarded")
+        assertEquals(
+            listOf(ConnectionState.Disconnected, ConnectionState.Connecting),
+            observedStates,
+            "The newer epoch must perform one synthetic teardown and start one fresh handshake",
+        )
+    }
+
+    @OptIn(kotlinx.coroutines.ExperimentalForInheritanceCoroutinesApi::class)
+    private class TrackingConnectionStateFlow(
+        private val snapshot: MutableStateFlow<RadioConnectionSnapshot>,
+        private val delegate: MutableStateFlow<ConnectionState> = MutableStateFlow(ConnectionState.Disconnected),
+    ) : MutableStateFlow<ConnectionState> by delegate {
+        override var value: ConnectionState
+            get() = delegate.value
+            set(value) {
+                val epoch =
+                    if (value == ConnectionState.Connected && delegate.value != ConnectionState.Connected) {
+                        snapshot.value.epoch + 1
+                    } else {
+                        snapshot.value.epoch
+                    }
+                snapshot.value = RadioConnectionSnapshot(value, epoch)
+                delegate.value = value
+            }
+
+        override suspend fun emit(value: ConnectionState) {
+            this.value = value
+        }
+
+        override fun tryEmit(value: ConnectionState): Boolean {
+            this.value = value
+            return true
+        }
+
+        override fun compareAndSet(expect: ConnectionState, update: ConnectionState): Boolean {
+            if (delegate.value != expect) return false
+            value = update
+            return true
+        }
     }
 
     @Test

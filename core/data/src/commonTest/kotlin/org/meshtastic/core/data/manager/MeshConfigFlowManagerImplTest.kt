@@ -51,6 +51,7 @@ import org.meshtastic.core.repository.NotificationPrefs
 import org.meshtastic.core.repository.PacketHandler
 import org.meshtastic.core.repository.PlatformAnalytics
 import org.meshtastic.core.repository.RadioConfigRepository
+import org.meshtastic.core.repository.RadioConnectionSnapshot
 import org.meshtastic.core.repository.RadioInterfaceService
 import org.meshtastic.core.repository.RadioSessionContext
 import org.meshtastic.core.repository.ServiceRepository
@@ -95,6 +96,7 @@ class MeshConfigFlowManagerImplTest {
     private val myNodeNum = 12345
     private val activeSession = RadioSessionContext(generation = 0L, address = "tcp:test-node")
     private val activeSessionFlow = MutableStateFlow<RadioSessionContext?>(activeSession)
+    private val connectionSnapshot = MutableStateFlow(RadioConnectionSnapshot(ConnectionState.Connected, 1L))
 
     private val protoMyNodeInfo =
         ProtoMyNodeInfo(
@@ -114,7 +116,9 @@ class MeshConfigFlowManagerImplTest {
         every { nodeManager.nodeDBbyNodeNum } returns emptyMap()
         every { nodeManager.myNodeNum } returns MutableStateFlow(null)
         activeSessionFlow.value = activeSession
+        connectionSnapshot.value = RadioConnectionSnapshot(ConnectionState.Connected, 1L)
         every { radioInterfaceService.activeSession } returns activeSessionFlow
+        every { radioInterfaceService.connectionSnapshot } returns connectionSnapshot
         every { radioInterfaceService.isSessionActive(any()) } calls
             {
                 activeSessionFlow.value == it.args[0] as RadioSessionContext
@@ -126,6 +130,25 @@ class MeshConfigFlowManagerImplTest {
                 @Suppress("UNCHECKED_CAST")
                 val block = it.args[1] as () -> Unit
                 if (activeSessionFlow.value == session) {
+                    block()
+                    true
+                } else {
+                    false
+                }
+            }
+        every { radioInterfaceService.runIfConnectionActive(any(), any(), any()) } calls
+            {
+                val session = it.args[0] as RadioSessionContext
+                val epoch = it.args[1] as Long
+
+                @Suppress("UNCHECKED_CAST")
+                val block = it.args[2] as () -> Unit
+                val snapshot = connectionSnapshot.value
+                if (
+                    activeSessionFlow.value == session &&
+                    snapshot.state is ConnectionState.Connected &&
+                    snapshot.epoch == epoch
+                ) {
                     block()
                     true
                 } else {
@@ -597,6 +620,41 @@ class MeshConfigFlowManagerImplTest {
 
         verify(mode = VerifyMode.exactly(1)) { nodeManager.installNodeInfo(any()) }
         verifySuspend(mode = VerifyMode.exactly(0)) { nodeRepository.installConfig(any(), any()) }
+        verify(mode = VerifyMode.exactly(0)) { nodeManager.setNodeDbReady(true) }
+        verify(mode = VerifyMode.exactly(0)) { nodeManager.setAllowNodeDbWrites(true) }
+        verify(mode = VerifyMode.exactly(0)) { serviceRepository.setConnectionState(ConnectionState.Connected) }
+        verifySuspend(mode = VerifyMode.exactly(0)) { connectionManager.onNodeDbReady() }
+    }
+
+    @Test
+    fun `connection epoch rollover during Stage 2 install rejects stale publication`() = testScope.runTest {
+        val installStarted = CompletableDeferred<Unit>()
+        val releaseInstall = CompletableDeferred<Unit>()
+        everySuspend { nodeRepository.installConfig(any(), any()) } calls
+            {
+                installStarted.complete(Unit)
+                releaseInstall.await()
+                emptyList()
+            }
+
+        handleMyInfo(protoMyNodeInfo)
+        advanceUntilIdle()
+        assertTrue(manager.handleLocalMetadata(metadata, activeSession))
+        advanceUntilIdle()
+        assertTrue(manager.handleConfigComplete(HandshakeConstants.CONFIG_NONCE, activeSession))
+        advanceTimeBy(STAGE_TRANSITION_ADVANCE_MS)
+        runCurrent()
+        assertTrue(manager.handleConfigComplete(HandshakeConstants.NODE_INFO_NONCE, activeSession))
+        runCurrent()
+        assertTrue(installStarted.isCompleted, "the old epoch install must be suspended at the DB boundary")
+
+        // TCP replaces its socket without replacing the RadioSessionContext. The physical epoch is therefore the
+        // only authority that can prevent old async Stage 2 work from publishing into the replacement handshake.
+        connectionSnapshot.value = RadioConnectionSnapshot(ConnectionState.DeviceSleep, 1L)
+        connectionSnapshot.value = RadioConnectionSnapshot(ConnectionState.Connected, 2L)
+        releaseInstall.complete(Unit)
+        advanceUntilIdle()
+
         verify(mode = VerifyMode.exactly(0)) { nodeManager.setNodeDbReady(true) }
         verify(mode = VerifyMode.exactly(0)) { nodeManager.setAllowNodeDbWrites(true) }
         verify(mode = VerifyMode.exactly(0)) { serviceRepository.setConnectionState(ConnectionState.Connected) }

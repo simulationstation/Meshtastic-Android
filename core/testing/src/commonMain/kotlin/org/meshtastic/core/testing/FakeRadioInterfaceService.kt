@@ -38,6 +38,7 @@ import org.meshtastic.core.model.ConnectionState
 import org.meshtastic.core.model.DeviceType
 import org.meshtastic.core.model.InterfaceId
 import org.meshtastic.core.model.MeshActivity
+import org.meshtastic.core.repository.RadioConnectionSnapshot
 import org.meshtastic.core.repository.RadioInterfaceService
 import org.meshtastic.core.repository.RadioSessionContext
 import org.meshtastic.core.repository.RadioSessionLease
@@ -61,6 +62,9 @@ class FakeRadioInterfaceService(override val serviceScope: CoroutineScope = Main
     /** Transport-level connection state (raw hardware link status). */
     private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
     override val connectionState: StateFlow<ConnectionState> = _connectionState
+
+    private val _connectionSnapshot = MutableStateFlow(RadioConnectionSnapshot(ConnectionState.Disconnected, 0L))
+    override val connectionSnapshot: StateFlow<RadioConnectionSnapshot> = _connectionSnapshot
 
     private val _currentDeviceAddressFlow = MutableStateFlow<String?>(null)
     override val currentDeviceAddressFlow: StateFlow<String?> = _currentDeviceAddressFlow
@@ -86,6 +90,24 @@ class FakeRadioInterfaceService(override val serviceScope: CoroutineScope = Main
             block()
             true
         }
+
+    override fun runIfConnectionActive(
+        session: RadioSessionContext,
+        connectionEpoch: Long,
+        block: () -> Unit,
+    ): Boolean = synchronized(sessionAdmissionLock) {
+        val snapshot = _connectionSnapshot.value
+        if (
+            !sessionAdmissionOpen ||
+            _activeSession.value != session ||
+            snapshot.state !is ConnectionState.Connected ||
+            snapshot.epoch != connectionEpoch
+        ) {
+            return@synchronized false
+        }
+        block()
+        true
+    }
 
     override suspend fun runWithSessionLease(
         session: RadioSessionContext,
@@ -225,11 +247,11 @@ class FakeRadioInterfaceService(override val serviceScope: CoroutineScope = Main
     override fun toInterfaceAddress(interfaceId: InterfaceId, rest: String): String = "$interfaceId:$rest"
 
     override fun onConnect() {
-        _connectionState.value = ConnectionState.Connected
+        setConnectionState(ConnectionState.Connected)
     }
 
     override fun onDisconnect(isPermanent: Boolean, errorMessage: String?, reason: TransportDisconnectReason?) {
-        _connectionState.value = ConnectionState.Disconnected
+        setConnectionState(if (isPermanent) ConnectionState.Disconnected else ConnectionState.DeviceSleep)
     }
 
     override fun handleFromRadio(bytes: ByteArray) {
@@ -249,6 +271,13 @@ class FakeRadioInterfaceService(override val serviceScope: CoroutineScope = Main
     }
 
     fun setConnectionState(state: ConnectionState) {
+        val epoch =
+            if (state == ConnectionState.Connected && _connectionState.value != ConnectionState.Connected) {
+                _connectionSnapshot.value.epoch + 1
+            } else {
+                _connectionSnapshot.value.epoch
+            }
+        _connectionSnapshot.value = RadioConnectionSnapshot(state, epoch)
         _connectionState.value = state
     }
 

@@ -54,6 +54,13 @@ interface RadioSessionAuthority {
     fun runIfSessionActive(session: RadioSessionContext, block: () -> Unit): Boolean
 
     /**
+     * Runs [block] only while [session] owns admission and [connectionEpoch] is the currently connected physical link.
+     * Implementations must make both checks and the synchronous side effect atomic with transport callbacks. This is
+     * stricter than [runIfSessionActive]: TCP can replace its socket while retaining the same transport session.
+     */
+    fun runIfConnectionActive(session: RadioSessionContext, connectionEpoch: Long, block: () -> Unit): Boolean
+
+    /**
      * Acquires a lifecycle lease for suspend [block]. Once admitted, teardown closes admission to later work and waits
      * for this block to finish before publishing session completion or starting a replacement transport. [block] may
      * use [RadioSessionLease.isCurrent] for transaction-bound checks that must remain valid through commit even after
@@ -77,13 +84,15 @@ interface RadioSessionAuthority {
  *
  * This is the **transport layer** — it manages the raw hardware connection (BLE, TCP, Serial, USB) to a Meshtastic
  * radio. Its [connectionState] reflects whether the physical link is up or down, **before** any handshake or
- * config-loading logic is applied.
+ * config-loading logic is applied. [connectionSnapshot] is the authoritative lifecycle surface because it preserves
+ * reconnect edges that a state value alone may conflate.
  *
  * **Important:** UI and feature modules should **never** observe [connectionState] directly. Instead, they should use
  * [ServiceRepository.connectionState], which is the canonical app-level connection state that accounts for handshake
  * progress, light-sleep policy, and other higher-level concerns. The only legitimate consumer of this transport-level
  * flow is [MeshConnectionManager], which bridges transport state changes into the app-level
- * [ServiceRepository.connectionState].
+ * [ServiceRepository.connectionState]. [MeshConnectionManager] consumes [connectionSnapshot]; [connectionState] remains
+ * the convenient current-level view for transport internals and diagnostics.
  *
  * @see ServiceRepository.connectionState
  */
@@ -105,12 +114,22 @@ interface RadioInterfaceService :
      * while the app is still performing the mesh handshake (config + node-info exchange), during which the app-level
      * state remains [ConnectionState.Connecting].
      *
-     * Only [MeshConnectionManager] should observe this flow. All other consumers (ViewModels, feature modules, UI) must
-     * use [ServiceRepository.connectionState].
+     * Feature and UI code must not observe this flow. [MeshConnectionManager] uses [connectionSnapshot] instead so a
+     * fast reconnect cannot disappear through StateFlow conflation.
      *
      * @see ServiceRepository.connectionState
      */
     val connectionState: StateFlow<ConnectionState>
+
+    /**
+     * Atomic transport state and connection epoch used by [MeshConnectionManager].
+     *
+     * The epoch increments for each real transition into [ConnectionState.Connected] and remains attached to that
+     * connection's later down state. Keeping both fields in one value prevents a delayed disconnect from being mistaken
+     * for part of a newer connection. It also preserves a reconnect edge when [connectionState] conflates a brief
+     * `DeviceSleep -> Connected` cycle back to the same `Connected` value.
+     */
+    val connectionSnapshot: StateFlow<RadioConnectionSnapshot>
 
     /** Flow of the current device address. */
     val currentDeviceAddressFlow: StateFlow<String?>
@@ -219,3 +238,5 @@ interface RadioInterfaceService :
     /** The scope in which interface-related coroutines should run. */
     val serviceScope: CoroutineScope
 }
+
+data class RadioConnectionSnapshot(val state: ConnectionState, val epoch: Long)

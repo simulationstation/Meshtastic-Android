@@ -72,6 +72,7 @@ import org.meshtastic.core.model.util.anonymize
 import org.meshtastic.core.network.repository.NetworkRepository
 import org.meshtastic.core.network.repository.SerialDevicePresence
 import org.meshtastic.core.repository.PlatformAnalytics
+import org.meshtastic.core.repository.RadioConnectionSnapshot
 import org.meshtastic.core.repository.RadioInterfaceService
 import org.meshtastic.core.repository.RadioPrefs
 import org.meshtastic.core.repository.RadioSessionContext
@@ -186,6 +187,9 @@ class SharedRadioInterfaceService(
     private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
     override val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
 
+    private val _connectionSnapshot = MutableStateFlow(RadioConnectionSnapshot(ConnectionState.Disconnected, 0L))
+    override val connectionSnapshot: StateFlow<RadioConnectionSnapshot> = _connectionSnapshot.asStateFlow()
+
     private val _currentDeviceAddressFlow = MutableStateFlow<String?>(radioPrefs.devAddr.value)
     override val currentDeviceAddressFlow: StateFlow<String?> = _currentDeviceAddressFlow.asStateFlow()
 
@@ -230,6 +234,24 @@ class SharedRadioInterfaceService(
             block()
             true
         }
+
+    override fun runIfConnectionActive(
+        session: RadioSessionContext,
+        connectionEpoch: Long,
+        block: () -> Unit,
+    ): Boolean = synchronized(sessionCallbackLock) {
+        val snapshot = _connectionSnapshot.value
+        if (
+            !sessionAdmissionOpen ||
+            activeTransportSession?.context != session ||
+            snapshot.state !is ConnectionState.Connected ||
+            snapshot.epoch != connectionEpoch
+        ) {
+            return@synchronized false
+        }
+        block()
+        true
+    }
 
     override suspend fun runWithSessionLease(
         session: RadioSessionContext,
@@ -825,7 +847,13 @@ class SharedRadioInterfaceService(
                 radioTransport = null
                 runningTransportId = null
                 isStarted = false
-                _connectionState.value = connectionStateBeforeStart
+                // A synchronous factory callback may already have published a connection epoch. Never roll that
+                // counter back or reuse it: restore only the prior state while preserving the latest consumed epoch.
+                synchronized(sessionCallbackLock) {
+                    _connectionSnapshot.value =
+                        RadioConnectionSnapshot(connectionStateBeforeStart, _connectionSnapshot.value.epoch)
+                    _connectionState.value = connectionStateBeforeStart
+                }
                 throw failure
             }
         radioTransport = newTransport
@@ -1085,6 +1113,8 @@ class SharedRadioInterfaceService(
         lastDataReceivedMillis = now()
         if (_connectionState.value != ConnectionState.Connected) {
             Logger.d { "Broadcasting connection state change to Connected" }
+            _connectionSnapshot.value =
+                RadioConnectionSnapshot(ConnectionState.Connected, _connectionSnapshot.value.epoch + 1)
             _connectionState.value = ConnectionState.Connected
         }
     }
@@ -1102,6 +1132,7 @@ class SharedRadioInterfaceService(
         val newTargetState = if (isPermanent) ConnectionState.Disconnected else ConnectionState.DeviceSleep
         if (_connectionState.value != newTargetState) {
             Logger.d { "Broadcasting connection state change to $newTargetState" }
+            _connectionSnapshot.value = RadioConnectionSnapshot(newTargetState, _connectionSnapshot.value.epoch)
             _connectionState.value = newTargetState
         }
     }

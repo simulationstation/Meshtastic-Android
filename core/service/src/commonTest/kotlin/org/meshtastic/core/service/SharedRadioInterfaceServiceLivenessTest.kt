@@ -290,12 +290,42 @@ class SharedRadioInterfaceServiceLivenessTest {
     }
 
     @Test
+    fun `connection snapshot preserves reconnect edges`() = runTest(testDispatcher) {
+        val service = createConnectedService(address = "t192.0.2.1")
+        try {
+            assertEquals(ConnectionState.Connected, service.connectionSnapshot.value.state)
+            assertEquals(1L, service.connectionSnapshot.value.epoch)
+
+            service.onConnect()
+            assertEquals(1L, service.connectionSnapshot.value.epoch, "Duplicate callbacks must not create an epoch")
+
+            service.onDisconnect(isPermanent = false)
+            assertEquals(ConnectionState.DeviceSleep, service.connectionSnapshot.value.state)
+            assertEquals(1L, service.connectionSnapshot.value.epoch)
+
+            service.onConnect()
+            assertEquals(ConnectionState.Connected, service.connectionSnapshot.value.state)
+            assertEquals(2L, service.connectionSnapshot.value.epoch, "A real reconnect must create a fresh epoch")
+
+            val session = requireNotNull(service.activeSession.value)
+            var ran = false
+            assertTrue(service.runIfConnectionActive(session, 2L) { ran = true })
+            assertTrue(ran)
+            assertFalse(service.runIfConnectionActive(session, 1L) { error("stale epoch ran") })
+        } finally {
+            service.disconnect()
+            advanceTimeBy(1_000)
+        }
+    }
+
+    @Test
     fun `transport factory failure revokes admitted session and retry uses a fresh generation`() =
         runTest(testDispatcher) {
             bluetoothRepository.setBluetoothEnabled(false)
             val networkAvailability = MutableStateFlow(false)
             var failCreation = true
             var failedSessionCallback: RadioInterfaceService? = null
+            var successfulSessionCallback: RadioInterfaceService? = null
             val service =
                 createConnectedService(
                     address = "t192.0.2.1",
@@ -310,6 +340,7 @@ class SharedRadioInterfaceServiceLivenessTest {
                         callback.onConnect()
                         throw IllegalStateException("transport factory failed")
                     }
+                    successfulSessionCallback = it.args[1] as RadioInterfaceService
                     FakeRadioTransport().also { createdTransports.add(it) }
                 }
             try {
@@ -322,6 +353,11 @@ class SharedRadioInterfaceServiceLivenessTest {
                     ConnectionState.Disconnected,
                     service.connectionState.value,
                     "a synchronous partial callback must not leave the failed transport connected",
+                )
+                assertEquals(
+                    1L,
+                    service.connectionSnapshot.value.epoch,
+                    "a partial connection callback must permanently consume its epoch",
                 )
                 assertTrue(createdTransports.isEmpty(), "a failed factory call must not publish a transport")
 
@@ -352,6 +388,10 @@ class SharedRadioInterfaceServiceLivenessTest {
                 assertEquals(2L, service.activeSession.value?.generation)
                 assertEquals("t192.0.2.1", service.activeSession.value?.address)
                 assertEquals(1, createdTransports.size, "the successful retry must publish exactly one transport")
+
+                requireNotNull(successfulSessionCallback).onConnect()
+                assertEquals(ConnectionState.Connected, service.connectionSnapshot.value.state)
+                assertEquals(2L, service.connectionSnapshot.value.epoch, "the retry must not reuse the failed epoch")
             } finally {
                 service.disconnect()
             }

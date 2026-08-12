@@ -56,6 +56,7 @@ import org.meshtastic.core.repository.PacketHandler
 import org.meshtastic.core.repository.PacketRepository
 import org.meshtastic.core.repository.PlatformAnalytics
 import org.meshtastic.core.repository.RadioConfigRepository
+import org.meshtastic.core.repository.RadioConnectionSnapshot
 import org.meshtastic.core.repository.RadioInterfaceService
 import org.meshtastic.core.repository.ServiceRepository
 import org.meshtastic.core.repository.SessionManager
@@ -133,16 +134,22 @@ class MeshConnectionManagerImpl(
     private var connectTimeMsec = 0L
     private var connectionRestored = false
 
+    /** Last physical connection epoch whose handshake was started. Guarded by [connectionMutex]. */
+    private var handledConnectionEpoch = 0L
+
     init {
-        // Bridge transport-level state into the canonical app-level state.
-        // This is the ONLY consumer of RadioInterfaceService.connectionState — it applies
-        // light-sleep policy and handshake awareness before writing to ServiceRepository.
+        // Bridge transport-level snapshots into the canonical app-level state.
+        // This is the ONLY consumer of RadioInterfaceService.connectionSnapshot — it applies
+        // light-sleep policy and handshake awareness before writing to ServiceRepository. The
+        // epoch preserves a down/up edge even if StateFlow conflates the brief down snapshot.
         // Guarded per-emission: one uncaught throw here would kill the sole bridge collector and
         // permanently freeze the app-level state (a stuck-"Connected" UI no transport event can fix).
-        radioInterfaceService.connectionState
-            .onEach { state ->
-                safeCatching { onRadioConnectionState(state) }
-                    .onFailure { Logger.e(it) { "Connection state bridge failed for $state; collector kept alive" } }
+        radioInterfaceService.connectionSnapshot
+            .onEach { snapshot ->
+                safeCatching { onRadioConnectionSnapshot(snapshot) }
+                    .onFailure {
+                        Logger.e(it) { "Connection state bridge failed for ${snapshot.state}; collector kept alive" }
+                    }
             }
             .launchIn(scope)
 
@@ -183,64 +190,106 @@ class MeshConnectionManagerImpl(
     }
 
     /**
-     * Bridges a transport-level [ConnectionState] into the canonical app-level state.
+     * Bridges an atomic transport-level [RadioConnectionSnapshot] into the canonical app-level state.
      *
      * Applies light-sleep policy (power-saving / router role) to decide whether a [ConnectionState.DeviceSleep] event
-     * should be surfaced as sleep or as a full disconnect, then delegates to [onConnectionChanged] for the actual state
-     * transition.
+     * should be surfaced as sleep or as a full disconnect. Connected snapshots bypass that policy lookup and use their
+     * epoch as the authoritative edge that starts one fresh handshake.
      */
-    private suspend fun onRadioConnectionState(newState: ConnectionState) {
+    private suspend fun onRadioConnectionSnapshot(snapshot: RadioConnectionSnapshot) {
+        if (snapshot.state is ConnectionState.Connected) {
+            onConnectionChanged(ConnectionState.Connected, sourceSnapshot = snapshot)
+            return
+        }
+
         val localConfig = radioConfigRepository.localConfigFlow.first()
         val isRouter = localConfig.device?.role == Config.DeviceConfig.Role.ROUTER
         val lsEnabled = localConfig.power?.is_power_saving == true || isRouter
 
         val effectiveState =
-            when (newState) {
-                is ConnectionState.Connected -> ConnectionState.Connected
-
+            when (snapshot.state) {
                 is ConnectionState.DeviceSleep ->
                     if (lsEnabled) ConnectionState.DeviceSleep else ConnectionState.Disconnected
 
                 is ConnectionState.Connecting -> ConnectionState.Connecting
 
                 is ConnectionState.Disconnected -> ConnectionState.Disconnected
+
+                is ConnectionState.Connected -> error("Connected snapshots return before config lookup")
             }
-        onConnectionChanged(effectiveState)
+        onConnectionChanged(effectiveState, sourceSnapshot = snapshot)
     }
 
-    private suspend fun onConnectionChanged(c: ConnectionState, fromState: ConnectionState? = null): Boolean =
-        connectionMutex.withLock {
-            val current = serviceRepository.connectionState.value
-            if (fromState != null && current != fromState) {
-                Logger.d { "Skipping connection transition $current -> $c, expected current state $fromState" }
-                return@withLock false
-            }
-            if (current == c) return@withLock false
-
-            // If the transport reports 'Connected', but we are already in the middle of a handshake (Connecting)
-            if (c is ConnectionState.Connected && current is ConnectionState.Connecting) {
-                Logger.d { "Ignoring redundant transport connection signal while handshake is in progress" }
-                return@withLock false
-            }
-
-            Logger.i { "onConnectionChanged: $current -> $c" }
-
-            sleepTimeout?.cancel()
-            sleepTimeout = null
-            preHandshakeJob?.cancel()
-            preHandshakeJob = null
-            // Collapse cancel+clear into one atomic swap so a concurrent re-arm cannot
-            // orphan a job in the gap between cancel and reassign.
-            handshakeTimeout.getAndSet(null)?.cancel()
-
-            when (c) {
-                is ConnectionState.Connecting -> serviceRepository.setConnectionState(ConnectionState.Connecting)
-                is ConnectionState.Connected -> handleConnected()
-                is ConnectionState.DeviceSleep -> handleDeviceSleep()
-                is ConnectionState.Disconnected -> handleDisconnected()
-            }
-            true
+    private suspend fun onConnectionChanged(
+        c: ConnectionState,
+        fromState: ConnectionState? = null,
+        sourceSnapshot: RadioConnectionSnapshot? = null,
+    ): Boolean = connectionMutex.withLock {
+        val current = serviceRepository.connectionState.value
+        if (isStaleSnapshot(sourceSnapshot)) {
+            Logger.d { "Skipping stale connection snapshot $sourceSnapshot" }
+            return@withLock false
         }
+        val connectionEpoch = sourceSnapshot?.epoch
+        val isFreshConnection = isFreshConnection(c, connectionEpoch)
+        if (fromState != null && current != fromState) {
+            Logger.d { "Skipping connection transition $current -> $c, expected current state $fromState" }
+            return@withLock false
+        }
+        if (shouldIgnoreTransition(current, c, isFreshConnection)) return@withLock false
+
+        Logger.i { "onConnectionChanged: $current -> $c" }
+        cancelConnectionJobs()
+        applyConnectionTransition(current, c, connectionEpoch)
+        true
+    }
+
+    private fun isStaleSnapshot(sourceSnapshot: RadioConnectionSnapshot?): Boolean =
+        sourceSnapshot != null && sourceSnapshot != radioInterfaceService.connectionSnapshot.value
+
+    private fun isFreshConnection(state: ConnectionState, epoch: Long?): Boolean =
+        state is ConnectionState.Connected && epoch != null && epoch > handledConnectionEpoch
+
+    private fun shouldIgnoreTransition(
+        current: ConnectionState,
+        target: ConnectionState,
+        isFreshConnection: Boolean,
+    ): Boolean {
+        val redundantHandshake = target is ConnectionState.Connected && current is ConnectionState.Connecting
+        if (!isFreshConnection && redundantHandshake) {
+            Logger.d { "Ignoring redundant transport connection signal while handshake is in progress" }
+        }
+        return !isFreshConnection && (current == target || redundantHandshake)
+    }
+
+    private fun cancelConnectionJobs() {
+        sleepTimeout?.cancel()
+        sleepTimeout = null
+        preHandshakeJob?.cancel()
+        preHandshakeJob = null
+        // Collapse cancel+clear into one atomic swap so a concurrent re-arm cannot orphan a job.
+        handshakeTimeout.getAndSet(null)?.cancel()
+    }
+
+    private fun applyConnectionTransition(current: ConnectionState, target: ConnectionState, epoch: Long?) {
+        when (target) {
+            is ConnectionState.Connecting -> serviceRepository.setConnectionState(ConnectionState.Connecting)
+
+            is ConnectionState.Connected -> {
+                if (epoch != null) handledConnectionEpoch = maxOf(handledConnectionEpoch, epoch)
+                if (current is ConnectionState.Connected || current is ConnectionState.Connecting) {
+                    // The newer epoch proves a real down/up cycle even when StateFlow conflated the down state.
+                    // Reproduce the missed teardown before starting work for the replacement connection.
+                    handleDisconnected()
+                }
+                handleConnected()
+            }
+
+            is ConnectionState.DeviceSleep -> handleDeviceSleep()
+
+            is ConnectionState.Disconnected -> handleDisconnected()
+        }
+    }
 
     private fun handleConnected() {
         // Track whether this connection was restored from device sleep (vs. a fresh connect),
